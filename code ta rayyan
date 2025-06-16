@@ -1,0 +1,405 @@
+// Teuku Ar Rayyan
+// D4 Teknik Elektronika
+// Codingan Tugas Akhir
+
+inisialisasi, filter
+---------------------------------------------------------------------------------------------------------------
+#include <Wire.h>
+#include <INA226_WE.h>
+#include <DHT.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <HTTPClient.h>
+
+#define I2C_ADDRESS 0x40
+INA226_WE ina226 = INA226_WE(I2C_ADDRESS);
+
+#define DHTPIN 4
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+#define MQ6_PIN 34
+
+#define BATT_GREEN 14
+#define BATT_YELLOW 12
+#define BATT_RED 13
+
+#define BUZZER_PIN 18
+#define LED_RED 27
+#define LED_YELLOW 26
+#define LED_GREEN 25
+
+#define WIFI_SSID "******************"
+#define WIFI_PASSWORD "******************"
+
+#define BOT_TOKEN "******************"
+#define CHAT_ID "******************"
+
+// Twilio (disiapkan, tapi tidak dipakai di webhook)
+#define TWILIO_SID "******************"
+#define TWILIO_AUTH "******************5"
+#define TWILIO_NUMBER "******************"
+#define TARGET_NUMBER "******************"
+
+// Zapier Webhook
+const char* zapierWebhook = "******************"; // Ganti dengan webhook kamu
+unsigned long lastZapierSendTime = 0;
+const unsigned long zapierInterval = 120000; // 2 menit
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+int batteryCapacity = 2000.0;
+int usedCapacity = 0;
+int remainingCapacity;
+float batteryVoltage;
+
+const float voltage_min = 6.8;
+const float voltage_max = 8.2;
+const float current_min = 0;
+const float current_max = 2000;
+
+bool buzzerState = false;
+
+unsigned long previousMillis = 0;
+unsigned long updateMillis = 0;
+uint32_t timeProgram, previousTimeProgram;
+
+uint8_t percentage;
+float busVoltage_V = 0;
+int current_mA = 0;
+int power_mW = 0;
+int sampleIndex = 0;
+int lpg = 0;
+float suhu = 0;
+String status;
+
+int mapInt(int x, int in_min, int in_max, int out_min, int out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+#define NUM_SAMPLES 200
+float voltageSamples[NUM_SAMPLES] = {0};
+float capacitySamples[NUM_SAMPLES] = {0};
+int voltageSampleIndex = 0;
+int capacitySampleIndex = 0;
+
+float mapVoltageToPercentage(float voltage) {
+  if (voltage >= 8.2) return 100.0;
+  if (voltage <= 6.8) return 0.0;
+  return (voltage - 6.8) * (100.0 / (8.2 - 6.8));
+}
+
+float getAverageVoltage() {
+  float sum = 0;
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    sum += voltageSamples[i];
+  }
+  return sum / NUM_SAMPLES;
+}
+
+float getMedianVoltage() {
+  float sorted[NUM_SAMPLES];
+  memcpy(sorted, voltageSamples, sizeof(sorted));
+  for (int i = 0; i < NUM_SAMPLES - 1; i++) {
+    for (int j = i + 1; j < NUM_SAMPLES; j++) {
+      if (sorted[i] > sorted[j]) {
+        float temp = sorted[i];
+        sorted[i] = sorted[j];
+        sorted[j] = temp;
+      }
+    }
+  }
+
+  if (NUM_SAMPLES % 2 == 0) {
+    return (sorted[NUM_SAMPLES / 2 - 1] + sorted[NUM_SAMPLES / 2]) / 2.0;
+  } else {
+    return sorted[NUM_SAMPLES / 2];
+  }
+}
+
+int stabilizePercentage(int newPercentage) {
+  static int lastPercentage = 100;
+  if (newPercentage < lastPercentage) {
+    lastPercentage = newPercentage;
+  }
+  return lastPercentage;
+}
+
+void sendZapierWebhook(int status) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(zapierWebhook);
+    http.addHeader("Content-Type", "application/json");
+
+    String json = "{\"status\":" + String(status) + ", \"timestamp\":\"" + String(millis()) + "\"}";
+    int httpCode = http.POST(json);
+
+    Serial.print("Webhook Zapier terkirim. HTTP Code: ");
+    Serial.println(httpCode);
+
+    http.end();
+  } else {
+    Serial.println("Gagal kirim ke Zapier, WiFi tidak terhubung.");
+  }
+}
+
+// SETUP
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  if (!ina226.init()) {
+    Serial.println("Gagal inisialisasi INA226!");
+    while (1);
+  }
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Menghubungkan ke Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\nTerhubung ke Wi-Fi dengan IP: " + WiFi.localIP().toString());
+
+  batteryVoltage = ina226.getBusVoltage_V();
+  int percentage = mapVoltageToPercentage(batteryVoltage);
+  int remainingCapacity = (percentage / 100.0) * batteryCapacity;
+
+  analogReadResolution(12);
+  dht.begin();
+  lcd.init();
+  lcd.backlight();
+
+  pinMode(BATT_GREEN, OUTPUT);
+  pinMode(BATT_YELLOW, OUTPUT);
+  pinMode(BATT_RED, OUTPUT);
+
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_YELLOW, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  client.setInsecure();
+
+  lcd.clear();
+  lcd.setCursor(2, 0);
+  lcd.print("Inisialisasi");
+  lcd.setCursor(5, 1);
+  lcd.print("Setup");
+  delay(2000);
+  
+  lcd.clear();
+  lcd.setCursor(4, 0);
+  lcd.print("Tunggu");
+  lcd.setCursor(4, 1);
+  lcd.print("10 Detik");
+  delay(2000);
+  lcd.clear();
+}
+
+// LOOP
+void loop() {
+  int lpg = readLPG();
+  float suhu = dht.readTemperature();
+  int current_mA = ina226.getCurrent_mA();
+  int percentage = mapVoltageToPercentage(batteryVoltage); 
+  static unsigned long previousUpdateMillis = 0;
+  unsigned long updateMillis = millis();
+
+  updateStatus();
+
+  if (updateMillis - previousUpdateMillis >= 1000) {
+    previousUpdateMillis = updateMillis;
+    statusBaterai();
+
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    if (numNewMessages) {
+      handleNewMessages(numNewMessages);
+    }
+    printOut();
+  }
+
+  // Kirim Webhook setiap 2 menit
+  if (millis() - lastZapierSendTime >= zapierInterval) {
+    sendZapierWebhook(1); // Status 1 = aktif
+    lastZapierSendTime = millis();
+  }
+}
+
+twilio
+-----------------------------------------------------------------------------------------------------------------------------------
+void makeTwilioCall() {
+    HTTPClient http;
+    String url = "******************************" + String(TWILIO_SID) + "/Calls.json";
+    String postData = "To=" + String(TARGET_NUMBER) + "&From=" + String(TWILIO_NUMBER) + "****************************";
+    http.begin(client, url);
+    http.setAuthorization(TWILIO_SID, TWILIO_AUTH);
+    http.addHeader("Content-Type", "****************************");
+    int httpResponseCode = http.POST(postData);
+    if (httpResponseCode > 0) {
+        Serial.println("✅ Panggilan berhasil dikirim ke Twilio!");
+    } else {
+        Serial.println("❌ Gagal melakukan panggilan! Error: " + String(httpResponseCode));
+    }
+    http.end();
+}
+
+
+new message
+-------------------------------------------------------------------------------------------------------------------------------------
+void handleNewMessages(int numNewMessages) {
+  for (int i = 0; i < numNewMessages; i++) {
+    String chatId = bot.messages[i].chat_id;
+    String text = bot.messages[i].text;
+    
+    if (text == "/cek") {
+      int lpg = readLPG();
+      float suhu = dht.readTemperature();
+      int percentage = mapVoltageToPercentage(batteryVoltage);
+      String status;
+        
+      // --- Prioritaskan status terberat (BAHAYA) lebih dulu ---
+      if (lpg > 2500 || percentage < 25 || suhu > 40) {
+        status = "BAHAYA";
+       Serial.println("⚠️ Suhu tinggi terdeteksi! Melakukan panggilan ke " + String(TARGET_NUMBER));
+        makeTwilioCall();
+        delay(60000); 
+      }
+      else if (lpg >= 1500 && suhu <= 40) {
+        status = "WASPADA";
+      }
+      else if (lpg < 1500 && suhu <= 40){
+        status = "AMAN";
+      }
+
+      // Kirim pesan ke Telegram
+      String message = "*Kondisi Lingkungan:*\n";
+      message += "\U0001F321 *Suhu:* " + String(suhu) + " °C\n";
+      message += "\U0001F4A7 *Battery:* " + String(percentage) + " %\n";
+      message += "\U0001F4A8 *LPG:* " + String(lpg) + " ppm\n";
+      message += "⚠️ *Status:* " + status;
+      bot.sendMessage(chatId, message, "Markdown");
+    }
+  }
+}
+
+print_out
+-------------------------------------------------------------------------------------------------------------------------------------
+void printOut(){
+  int lpg = readLPG();
+  float suhu = dht.readTemperature();
+  int current_mA = ina226.getCurrent_mA(); // Baca arus dalam miliampere (mA)
+  int percentage = mapVoltageToPercentage(batteryVoltage); 
+
+  // Cetak status ke Serial Monitor
+  Serial.print("Tegangan: "); Serial.print(batteryVoltage);
+  Serial.print(" V | Arus Terpakai: "); Serial.print(current_mA);
+  Serial.print(" mA | Kapasitas Tersisa: "); Serial.print(remainingCapacity); Serial.println(" mAh");
+  Serial.println("======================");
+
+  // Serial.print(batteryVoltage); Serial.print("\t");
+  // Serial.print(current_mA); Serial.print("\t");
+  // Serial.print(remainingCapacity); Serial.print("\t");
+  // Serial.print(percentage); Serial.print("\t");
+  Serial.println();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("GAS: "); lcd.print(lpg); lcd.print(" ppm");
+  lcd.setCursor(0, 1);
+  lcd.print("Status: "); lcd.print(status);
+}
+
+Status_battery
+-------------------------------------------------------------------------------------------------------------------------------------
+void statusBaterai() {
+  unsigned long currentMillis = millis();
+  int current_mA = ina226.getCurrent_mA(); // Baca arus dalam miliampere (mA)
+
+  // Hitung waktu berlalu dalam jam
+  int elapsedTime = (currentMillis - previousMillis) / 3600000.0; // ms ke jam
+  previousMillis = currentMillis;
+
+  // Perbaikan: Tambahkan kapasitas terpakai dari arus yang dikonsumsi
+  usedCapacity += current_mA * elapsedTime;
+
+  // Hitung ulang kapasitas tersisa dari tegangan
+  batteryVoltage = ina226.getBusVoltage_V();
+  int percentage = mapVoltageToPercentage(batteryVoltage);
+  remainingCapacity = (percentage / 100.0) * batteryCapacity;
+
+  // Pastikan kapasitas tetap dalam batas yang benar
+  remainingCapacity = constrain(remainingCapacity, 0, batteryCapacity);
+  usedCapacity = constrain(usedCapacity, 0, batteryCapacity); // Pastikan tidak lebih dari 2000mAh
+
+  // Batasi persentase agar tetap dalam rentang 0 - 100%
+  percentage = constrain(percentage, 0, 100);
+
+  // Kontrol LED berdasarkan kapasitas baterai
+  if (percentage >= 80) {
+    digitalWrite(BATT_GREEN, HIGH);
+    digitalWrite(BATT_YELLOW, LOW);
+    digitalWrite(BATT_RED, LOW);
+  }
+  else if (percentage >= 25 && percentage < 80) {
+    digitalWrite(BATT_GREEN, LOW);
+    digitalWrite(BATT_YELLOW, HIGH);
+    digitalWrite(BATT_RED, LOW);
+  }
+  else {
+    digitalWrite(BATT_GREEN, LOW);
+    digitalWrite(BATT_YELLOW, LOW);
+    digitalWrite(BATT_RED, HIGH);
+  }
+}
+
+Status_LPG_Ino
+----------------------------------------------------------------------------------------------------------------------------
+void updateStatus() {
+  int lpg = readLPG();
+  float suhu = dht.readTemperature();
+  int percentage = mapVoltageToPercentage(batteryVoltage); 
+  unsigned long currentMillis = millis();
+  static unsigned long previousBuzzerMillis = 0;
+  static bool buzzerState = false;
+
+  // Prioritaskan status terberat (BAHAYA) lebih dulu
+  if (lpg > 2500 || percentage < 25 || suhu > 40) {
+    status = "BAHAYA";
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_YELLOW, LOW);
+    digitalWrite(LED_RED, HIGH);
+    digitalWrite(BUZZER_PIN, HIGH);  // Buzzer menyala terus
+  }
+  else if (lpg >= 1500 && suhu <= 40) {
+    status = "WASPADA";
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_YELLOW, HIGH);
+    digitalWrite(LED_RED, LOW);
+
+    // Buzzer berkedip setiap 200ms
+    if (currentMillis - previousBuzzerMillis >= 200) {
+      previousBuzzerMillis = currentMillis;
+      buzzerState = !buzzerState;
+      digitalWrite(BUZZER_PIN, buzzerState);
+    }
+  }
+  else if (lpg < 1500 && suhu <= 40){
+    status = "AMAN";
+    digitalWrite(LED_GREEN, HIGH);
+    digitalWrite(LED_YELLOW, LOW);
+    digitalWrite(LED_RED, LOW);
+    digitalWrite(BUZZER_PIN, LOW);  // Matikan buzzer
+  }
+}
+
+float readLPG() {
+    int analogValue = analogRead(MQ6_PIN);
+    float voltage = analogValue * (3.3 / 4095.0); // Konversi ke tegangan
+    float ppm = voltage * 1000; // Konversi sederhana ke ppm (kalibrasi diperlukan)
+    return ppm;
+}

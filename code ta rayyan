@@ -43,10 +43,7 @@ DHT dht(DHTPIN, DHTTYPE);
 #define TWILIO_NUMBER "******************"
 #define TARGET_NUMBER "******************"
 
-// Zapier Webhook
-const char* zapierWebhook = "******************"; // Ganti dengan webhook kamu
-unsigned long lastZapierSendTime = 0;
-const unsigned long zapierInterval = 120000; // 2 menit
+const char* zapierWebhook = "*********************"
 
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
@@ -129,21 +126,19 @@ int stabilizePercentage(int newPercentage) {
   return lastPercentage;
 }
 
-void sendZapierWebhook(int status) {
+// zapier
+void sendZapierWebhook(String message) {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
     http.begin(zapierWebhook);
     http.addHeader("Content-Type", "application/json");
-
-    String json = "{\"status\":" + String(status) + ", \"timestamp\":\"" + String(millis()) + "\"}";
+    String json = "{\"alert\":\"" + message + "\"}";
     int httpCode = http.POST(json);
-
-    Serial.print("Webhook Zapier terkirim. HTTP Code: ");
+    Serial.print("Webhook terkirim. HTTP Code: ");
     Serial.println(httpCode);
-
     http.end();
   } else {
-    Serial.println("Gagal kirim ke Zapier, WiFi tidak terhubung.");
+    Serial.println("WiFi tidak terhubung, webhook gagal dikirim.");
   }
 }
 
@@ -223,12 +218,10 @@ void loop() {
     printOut();
   }
 
-  // Kirim Webhook setiap 2 menit
-  if (millis() - lastZapierSendTime >= zapierInterval) {
-    sendZapierWebhook(1); // Status 1 = aktif
-    lastZapierSendTime = millis();
+ if (!alertSent && millis() - lastValidSensorTime > 120000) {
+    sendZapierWebhook("ALAT MATI: Tidak ada data sensor selama lebih dari 2 menit");
+    alertSent = true;
   }
-}
 
 twilio
 -----------------------------------------------------------------------------------------------------------------------------------
